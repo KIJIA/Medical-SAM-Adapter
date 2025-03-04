@@ -59,93 +59,92 @@ global_step_best = 0
 epoch_loss_values = []
 metric_values = []
 
-def train_sam(args, net: nn.Module, optimizer, train_loader,
-          epoch, writer, schedulers=None, vis = 50):
+def train_sam(args, net: nn.Module, optimizer, train_loader, epoch, writer, schedulers=None, vis=50):
     hard = 0
     epoch_loss = 0
     ind = 0
-    # train mode
+    # 设置模型为训练模式
     net.train()
     optimizer.zero_grad()
 
     epoch_loss = 0
     GPUdevice = torch.device('cuda:' + str(args.gpu_device))
 
+    # 根据参数选择损失函数
     if args.thd:
         lossfunc = DiceCELoss(sigmoid=True, squared_pred=True, reduction='mean')
     else:
         lossfunc = criterion_G
 
+    # 使用 tqdm 显示训练进度
     with tqdm(total=len(train_loader), desc=f'Epoch {epoch}', unit='img') as pbar:
         for pack in train_loader:
+            # 清空 CUDA 缓存
             # torch.cuda.empty_cache()
-            imgs = pack['image'].to(dtype = torch.float32, device = GPUdevice)
-            masks = pack['label'].to(dtype = torch.float32, device = GPUdevice)
-            # for k,v in pack['image_meta_dict'].items():
-            #     print(k)
+            imgs = pack['image'].to(dtype=torch.float32, device=GPUdevice)
+            masks = pack['label'].to(dtype=torch.float32, device=GPUdevice)
+
+            # 生成点击提示
             if 'pt' not in pack:
-                imgs, pt, masks = generate_click_prompt(imgs, masks)
+                imgs, pt, masks = generate_click_prompt(imgs, masks) # 随机生成一个为掩码的点提示
             else:
                 pt = pack['pt']
                 point_labels = pack['p_label']
             name = pack['image_meta_dict']['filename_or_obj']
 
+            # 处理 3D 图像
             if args.thd:
                 imgs, pt, masks = generate_click_prompt(imgs, masks)
-
                 pt = rearrange(pt, 'b n d -> (b d) n')
                 imgs = rearrange(imgs, 'b c h w d -> (b d) c h w ')
                 masks = rearrange(masks, 'b c h w d -> (b d) c h w ')
-
-                imgs = imgs.repeat(1,3,1,1)
+                imgs = imgs.repeat(1, 3, 1, 1)
                 point_labels = torch.ones(imgs.size(0))
-
-                imgs = torchvision.transforms.Resize((args.image_size,args.image_size))(imgs)
-                masks = torchvision.transforms.Resize((args.out_size,args.out_size))(masks)
+                imgs = torchvision.transforms.Resize((args.image_size, args.image_size))(imgs)
+                masks = torchvision.transforms.Resize((args.out_size, args.out_size))(masks)
             showp = pt
 
             mask_type = torch.float32
             ind += 1
-            b_size,c,w,h = imgs.size()
-            longsize = w if w >=h else h
+            b_size, c, w, h = imgs.size()
+            longsize = max(w, h)
 
+            # 处理点提示
             if point_labels.clone().flatten()[0] != -1:
-                    # point_coords = samtrans.ResizeLongestSide(longsize).apply_coords(pt, (h, w))
                 point_coords = pt
                 coords_torch = torch.as_tensor(point_coords, dtype=torch.float, device=GPUdevice)
                 labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=GPUdevice)
-                if(len(point_labels.shape)==1): # only one point prompt
+                if len(point_labels.shape) == 1:  # 只有一个点提示
                     coords_torch, labels_torch, showp = coords_torch[None, :, :], labels_torch[None, :], showp[None, :, :]
                 pt = (coords_torch, labels_torch)
 
-            '''init'''
+            '''初始化'''
             if hard:
                 true_mask_ave = (true_mask_ave > 0.5).float()
-                #true_mask_ave = cons_tensor(true_mask_ave)
-            # imgs = imgs.to(dtype = mask_type,device = GPUdevice)
 
-            '''Train'''
+            '''训练'''
+            # 根据模型类型设置参数是否需要梯度
             if args.mod == 'sam_adpt':
-                for n, value in net.image_encoder.named_parameters(): 
+                for n, value in net.image_encoder.named_parameters():# 获取模型参数及名称
                     if "Adapter" not in n:
-                        value.requires_grad = False
+                        value.requires_grad = False # 冻结除Adapter外的所有参数
                     else:
                         value.requires_grad = True
             elif args.mod == 'sam_lora' or args.mod == 'sam_adalora':
                 from models.common import loralib as lora
                 lora.mark_only_lora_as_trainable(net.image_encoder)
                 if args.mod == 'sam_adalora':
-                    # Initialize the RankAllocator 
                     rankallocator = lora.RankAllocator(
                         net.image_encoder, lora_r=4, target_rank=8,
-                        init_warmup=500, final_warmup=1500, mask_interval=10, 
-                        total_step=3000, beta1=0.85, beta2=0.85, 
+                        init_warmup=500, final_warmup=1500, mask_interval=10,
+                        total_step=3000, beta1=0.85, beta2=0.85,
                     )
             else:
-                for n, value in net.image_encoder.named_parameters(): 
+                for n, value in net.image_encoder.named_parameters():
                     value.requires_grad = True
-                    
-            imge= net.image_encoder(imgs)
+
+            # 获取图像编码
+            imge = net.image_encoder(imgs)
             with torch.no_grad():
                 if args.net == 'sam' or args.net == 'mobile_sam':
                     se, de = net.prompt_encoder(
@@ -154,26 +153,27 @@ def train_sam(args, net: nn.Module, optimizer, train_loader,
                         masks=None,
                     )
                 elif args.net == "efficient_sam":
-                    coords_torch,labels_torch = transform_prompt(coords_torch,labels_torch,h,w)
+                    coords_torch, labels_torch = transform_prompt(coords_torch, labels_torch, h, w)
                     se = net.prompt_encoder(
                         coords=coords_torch,
                         labels=labels_torch,
                     )
-                    
+
+            # 获取预测结果
             if args.net == 'sam':
                 pred, _ = net.mask_decoder(
                     image_embeddings=imge,
-                    image_pe=net.prompt_encoder.get_dense_pe(), 
+                    image_pe=net.prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=se,
-                    dense_prompt_embeddings=de, 
+                    dense_prompt_embeddings=de,
                     multimask_output=(args.multimask_output > 1),
                 )
             elif args.net == 'mobile_sam':
                 pred, _ = net.mask_decoder(
                     image_embeddings=imge,
-                    image_pe=net.prompt_encoder.get_dense_pe(), 
+                    image_pe=net.prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=se,
-                    dense_prompt_embeddings=de, 
+                    dense_prompt_embeddings=de,
                     multimask_output=False,
                 )
             elif args.net == "efficient_sam":
@@ -185,37 +185,39 @@ def train_sam(args, net: nn.Module, optimizer, train_loader,
                 )
                 pred, _ = net.mask_decoder(
                     image_embeddings=imge,
-                    image_pe=net.prompt_encoder.get_dense_pe(), 
+                    image_pe=net.prompt_encoder.get_dense_pe(),
                     sparse_prompt_embeddings=se,
                     multimask_output=False,
                 )
-                
-            # Resize to the ordered output size
-            pred = F.interpolate(pred,size=(args.out_size,args.out_size))
 
+            # 调整预测结果的大小
+            pred = F.interpolate(pred, size=(args.out_size, args.out_size))
+
+            # 计算损失
             loss = lossfunc(pred, masks)
 
+            # 更新进度条
             pbar.set_postfix(**{'loss (batch)': loss.item()})
             epoch_loss += loss.item()
 
-            # nn.utils.clip_grad_value_(net.parameters(), 0.1)
+            # 反向传播和优化
             if args.mod == 'sam_adalora':
-                (loss+lora.compute_orth_regu(net, regu_weight=0.1)).backward()
+                (loss + lora.compute_orth_regu(net, regu_weight=0.1)).backward()
                 optimizer.step()
                 rankallocator.update_and_mask(net, ind)
             else:
                 loss.backward()
                 optimizer.step()
-            
+
             optimizer.zero_grad()
 
-            '''vis images'''
+            '''可视化图像'''
             if vis:
                 if ind % vis == 0:
                     namecat = 'Train'
                     for na in name[:2]:
                         namecat = namecat + na.split('/')[-1].split('.')[0] + '+'
-                    vis_image(imgs,pred,masks, os.path.join(args.path_helper['sample_path'], namecat+'epoch+' +str(epoch) + '.jpg'), reverse=False, points=showp)
+                    vis_image(imgs, pred, masks, os.path.join(args.path_helper['sample_path'], namecat + 'epoch+' + str(epoch) + '.jpg'), reverse=False, points=showp)
 
             pbar.update()
 

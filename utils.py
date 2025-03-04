@@ -1220,4 +1220,3 @@ def random_box(multi_rater):
     y_max = random.choice(np.arange(y_max-10,y_max+11))
 
     return x_min, x_max, y_min, y_max
-
